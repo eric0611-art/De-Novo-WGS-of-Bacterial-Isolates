@@ -187,14 +187,20 @@ kraken2 \
     --output "$KRAKEN_OUTPUT"
 
 # ── DECISION POINT 2: Evaluate Kraken2 results ───────────────────────────────
+KRAKEN_TMP="${REPORTDIR}/.kraken_species_sorted.tmp"
+
 UNCLASSIFIED_PCT=$(awk '$4 == "U" {printf "%.2f", $1}' "$KRAKEN_REPORT")
-TOP_SPECIES_LINE=$(awk '$4 == "S" {print $0}' "$KRAKEN_REPORT" | sort -t$'\t' -k1 -rn | head -1)
+
+# Extract and sort species-level hits into a temp file (avoids sort|head pipe)
+awk '$4 == "S"' "$KRAKEN_REPORT" | sort -t$'\t' -k1 -rn > "$KRAKEN_TMP"
+
+TOP_SPECIES_LINE=$(awk 'NR==1' "$KRAKEN_TMP")
 TOP_SPECIES_PCT=$(echo "$TOP_SPECIES_LINE" | awk '{printf "%.2f", $1}')
 TOP_SPECIES_NAME=$(echo "$TOP_SPECIES_LINE" | awk -F'\t' '{gsub(/^[ \t]+|[ \t]+$/, "", $6); print $6}')
 TOP_GENUS=$(echo "$TOP_SPECIES_NAME" | awk '{print $1}')
 
 # Get top 5 species for the report
-TOP5_SPECIES=$(awk '$4 == "S" {print $0}' "$KRAKEN_REPORT" | sort -t$'\t' -k1 -rn | head -5)
+TOP5_SPECIES=$(awk 'NR<=5' "$KRAKEN_TMP")
 
 cat >> "$SUMMARY" <<EOF
 
@@ -206,6 +212,9 @@ Top genus:     ${TOP_GENUS}
 Top 5 species hits:
 $(echo "$TOP5_SPECIES" | awk -F'\t' '{gsub(/^[ \t]+|[ \t]+$/,"",$6); printf "  %.2f%%  %s\n", $1, $6}')
 EOF
+
+# Clean up temp file
+rm -f "$KRAKEN_TMP"
 
 # Store top genus for downstream use
 echo "${TOP_GENUS}" > "${PIPELINE_META}/top_genus"
