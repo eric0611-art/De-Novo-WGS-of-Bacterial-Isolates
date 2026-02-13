@@ -1,0 +1,252 @@
+#!/bin/bash
+#SBATCH --job-name=QC_preprocess
+#SBATCH -N 1
+#SBATCH -n 1
+#SBATCH -c 8
+#SBATCH --partition=general
+#SBATCH --qos=general
+#SBATCH --mail-type=ALL
+#SBATCH --mem=100G
+#SBATCH --mail-user=fzn25002@uconn.edu
+#SBATCH -o qc_preprocess_%j.out
+#SBATCH -e qc_preprocess_%j.err
+
+set -euo pipefail
+
+###############################################################################
+# SCRIPT 1 — QC & PREPROCESSING
+# Steps: Pre-trim FastQC → fastp → Post-trim FastQC → Kraken2
+# Outputs: Trimmed reads, QC reports, Kraken classification, pipeline metadata
+###############################################################################
+
+# ── CONFIGURATION ──────────────────────────────────────────────────────────────
+# Modify these variables for each sample or source them from an external config
+SAMPLE="88899c100_S110_L001"
+RAWDIR="/labs/Hird/Eric/EAGER_sequences/1_sample/88899content100-416743538"
+KRAKENDB="/isg/shared/databases/kraken/v06.2025/standard"
+
+# Derived paths
+WORKDIR="${RAWDIR}"
+TRIMDIR="${WORKDIR}/trimmed_sequences"
+REPORTDIR="${WORKDIR}/qc_reports"
+PIPELINE_META="${WORKDIR}/.pipeline_meta"
+SUMMARY="${WORKDIR}/pipeline_summary.txt"
+
+R1="${RAWDIR}/${SAMPLE}_R1_001.fastq.gz"
+R2="${RAWDIR}/${SAMPLE}_R2_001.fastq.gz"
+
+# Quality thresholds
+MIN_READS=100000          # minimum reads after trimming to proceed
+MIN_Q30=0.70              # minimum Q30 rate after trimming
+CONTAM_WARN_PCT=50        # warn if top species < this %
+
+# ── SETUP ──────────────────────────────────────────────────────────────────────
+mkdir -p "$TRIMDIR" "$REPORTDIR" "$PIPELINE_META"
+
+# Initialize summary report
+cat > "$SUMMARY" <<EOF
+================================================================================
+  PIPELINE SUMMARY: ${SAMPLE}
+  Started: $(date)
+  Working directory: ${WORKDIR}
+================================================================================
+EOF
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$SUMMARY"
+}
+
+# Verify raw reads exist
+if [[ ! -f "$R1" ]] || [[ ! -f "$R2" ]]; then
+    log "FATAL: Raw read files not found: $R1 and/or $R2"
+    exit 1
+fi
+
+# ── STEP 1: PRE-TRIM FASTQC ──────────────────────────────────────────────────
+log "STEP 1: Running pre-trim FastQC..."
+module load fastqc/0.12.1
+
+PRE_FASTQC_DIR="${REPORTDIR}/pre_trim_fastqc"
+mkdir -p "$PRE_FASTQC_DIR"
+fastqc --outdir "$PRE_FASTQC_DIR" --threads 8 "$R1" "$R2"
+
+echo -e "\n--- PRE-TRIM FASTQC ---" >> "$SUMMARY"
+echo "Reports: ${PRE_FASTQC_DIR}" >> "$SUMMARY"
+
+# ── STEP 2: FASTP ─────────────────────────────────────────────────────────────
+log "STEP 2: Running fastp trimming and filtering..."
+module load fastp/0.23.2
+
+fastp \
+    --in1 "$R1" \
+    --in2 "$R2" \
+    --out1 "${TRIMDIR}/${SAMPLE}_R1_001.fastq.gz" \
+    --out2 "${TRIMDIR}/${SAMPLE}_R2_001.fastq.gz" \
+    --detect_adapter_for_pe \
+    --correction \
+    --cut_front \
+    --cut_tail \
+    --cut_window_size 4 \
+    --cut_mean_quality 15 \
+    --qualified_quality_phred 15 \
+    --length_required 30 \
+    --thread 8 \
+    --json "${REPORTDIR}/${SAMPLE}_fastp.json" \
+    --html "${REPORTDIR}/${SAMPLE}_fastp.html"
+
+# ── DECISION POINT 1: Evaluate fastp results ─────────────────────────────────
+FASTP_JSON="${REPORTDIR}/${SAMPLE}_fastp.json"
+
+eval $(python3 -c "
+import json, sys
+with open('${FASTP_JSON}') as f:
+    d = json.load(f)
+s = d['summary']
+print(f\"READS_BEFORE={s['before_filtering']['total_reads']}\")
+print(f\"READS_AFTER={s['after_filtering']['total_reads']}\")
+print(f\"Q30_RATE={s['after_filtering']['q30_rate']}\")
+print(f\"READ1_LENGTH={s['after_filtering']['read1_mean_length']}\")
+print(f\"READ2_LENGTH={s['after_filtering']['read2_mean_length']}\")
+print(f\"DUPLICATION_RATE={d['duplication']['rate']}\")
+try:
+    print(f\"ADAPTER_R1={d['adapter_cutting']['adapter_trimmed_reads']}\")
+except KeyError:
+    print('ADAPTER_R1=N/A')
+")
+
+cat >> "$SUMMARY" <<EOF
+
+--- FASTP TRIMMING RESULTS ---
+Reads before filtering:  ${READS_BEFORE}
+Reads after filtering:   ${READS_AFTER}
+Reads removed:           $((READS_BEFORE - READS_AFTER)) ($(awk "BEGIN {printf \"%.1f\", (($READS_BEFORE-$READS_AFTER)/$READS_BEFORE)*100}")%)
+Q30 rate (post-filter):  ${Q30_RATE}
+Mean read length R1:     ${READ1_LENGTH}
+Mean read length R2:     ${READ2_LENGTH}
+Duplication rate:        ${DUPLICATION_RATE}
+Adapter-trimmed reads:   ${ADAPTER_R1}
+EOF
+
+# Store metadata for downstream scripts (coverage calculation, etc.)
+echo "${READS_AFTER}" > "${PIPELINE_META}/reads_after_trim"
+echo "${READ1_LENGTH}" > "${PIPELINE_META}/read1_mean_length"
+echo "${READ2_LENGTH}" > "${PIPELINE_META}/read2_mean_length"
+
+# Gate: minimum read count
+if (( READS_AFTER < MIN_READS )); then
+    log "FATAL: Read count after filtering (${READS_AFTER}) below minimum threshold (${MIN_READS})"
+    log "Pipeline cannot produce a reliable assembly. Exiting."
+    exit 1
+fi
+
+# Gate: Q30 quality check
+Q30_PASS=$(awk "BEGIN {print ($Q30_RATE >= $MIN_Q30) ? 1 : 0}")
+if [[ "$Q30_PASS" -eq 0 ]]; then
+    log "WARNING: Q30 rate (${Q30_RATE}) below recommended threshold (${MIN_Q30})"
+    echo "  → Consider tightening fastp quality parameters" >> "$SUMMARY"
+    echo "  → Proceeding with caution" >> "$SUMMARY"
+fi
+
+# Gate: excessive read loss
+READ_LOSS_PCT=$(awk "BEGIN {printf \"%.1f\", (($READS_BEFORE-$READS_AFTER)/$READS_BEFORE)*100}")
+EXCESSIVE_LOSS=$(awk "BEGIN {print ($READ_LOSS_PCT > 50) ? 1 : 0}")
+if [[ "$EXCESSIVE_LOSS" -eq 1 ]]; then
+    log "WARNING: >50% of reads lost during trimming (${READ_LOSS_PCT}%)"
+    echo "  → Raw data quality may be poor — inspect pre-trim FastQC reports" >> "$SUMMARY"
+fi
+
+# ── STEP 3: POST-TRIM FASTQC ─────────────────────────────────────────────────
+log "STEP 3: Running post-trim FastQC..."
+module load fastqc/0.12.1
+
+POST_FASTQC_DIR="${REPORTDIR}/post_trim_fastqc"
+mkdir -p "$POST_FASTQC_DIR"
+fastqc --outdir "$POST_FASTQC_DIR" --threads 8 \
+    "${TRIMDIR}/${SAMPLE}_R1_001.fastq.gz" \
+    "${TRIMDIR}/${SAMPLE}_R2_001.fastq.gz"
+
+echo -e "\n--- POST-TRIM FASTQC ---" >> "$SUMMARY"
+echo "Reports: ${POST_FASTQC_DIR}" >> "$SUMMARY"
+
+# ── STEP 4: KRAKEN2 ──────────────────────────────────────────────────────────
+log "STEP 4: Running Kraken2 taxonomic classification..."
+module load kraken/2.1.6
+module load gcc/10.2.0
+
+KRAKEN_REPORT="${REPORTDIR}/${SAMPLE}_kraken_report.txt"
+KRAKEN_OUTPUT="${REPORTDIR}/${SAMPLE}_kraken_output.txt"
+
+kraken2 \
+    --db "$KRAKENDB" \
+    --paired \
+    --threads 8 \
+    "${TRIMDIR}/${SAMPLE}_R1_001.fastq.gz" \
+    "${TRIMDIR}/${SAMPLE}_R2_001.fastq.gz" \
+    --report "$KRAKEN_REPORT" \
+    --output "$KRAKEN_OUTPUT"
+
+# ── DECISION POINT 2: Evaluate Kraken2 results ───────────────────────────────
+UNCLASSIFIED_PCT=$(awk '$4 == "U" {printf "%.2f", $1}' "$KRAKEN_REPORT")
+TOP_SPECIES_LINE=$(awk '$4 == "S" {print $0}' "$KRAKEN_REPORT" | sort -t$'\t' -k1 -rn | head -1)
+TOP_SPECIES_PCT=$(echo "$TOP_SPECIES_LINE" | awk '{printf "%.2f", $1}')
+TOP_SPECIES_NAME=$(echo "$TOP_SPECIES_LINE" | awk -F'\t' '{gsub(/^[ \t]+|[ \t]+$/, "", $6); print $6}')
+TOP_GENUS=$(echo "$TOP_SPECIES_NAME" | awk '{print $1}')
+
+# Get top 5 species for the report
+TOP5_SPECIES=$(awk '$4 == "S" {print $0}' "$KRAKEN_REPORT" | sort -t$'\t' -k1 -rn | head -5)
+
+cat >> "$SUMMARY" <<EOF
+
+--- KRAKEN2 CLASSIFICATION ---
+Unclassified:  ${UNCLASSIFIED_PCT}%
+Top species:   ${TOP_SPECIES_NAME} (${TOP_SPECIES_PCT}%)
+Top genus:     ${TOP_GENUS}
+
+Top 5 species hits:
+$(echo "$TOP5_SPECIES" | awk -F'\t' '{gsub(/^[ \t]+|[ \t]+$/,"",$6); printf "  %.2f%%  %s\n", $1, $6}')
+EOF
+
+# Store top genus for downstream use
+echo "${TOP_GENUS}" > "${PIPELINE_META}/top_genus"
+echo "${TOP_SPECIES_NAME}" > "${PIPELINE_META}/top_species"
+
+# Contamination warning
+LOW_CLASS=$(awk "BEGIN {print ($TOP_SPECIES_PCT < $CONTAM_WARN_PCT) ? 1 : 0}")
+if [[ "$LOW_CLASS" -eq 1 ]]; then
+    log "WARNING: Top species accounts for only ${TOP_SPECIES_PCT}% of classified reads"
+    echo "  → Possible contamination, mixed culture, or novel organism" >> "$SUMMARY"
+    echo "  → Review full Kraken report: ${KRAKEN_REPORT}" >> "$SUMMARY"
+fi
+
+# Determine BUSCO lineage from Kraken results
+# Expand this case block as needed for your organisms
+case "$TOP_GENUS" in
+    Bacillus|Lysinibacillus|Paenibacillus|Staphylococcus|Listeria)
+        BUSCO_LINEAGE="bacillales_odb10" ;;
+    Escherichia|Salmonella|Klebsiella|Enterobacter|Citrobacter|Shigella)
+        BUSCO_LINEAGE="enterobacterales_odb10" ;;
+    Pseudomonas|Acinetobacter)
+        BUSCO_LINEAGE="pseudomonadales_odb10" ;;
+    Lactobacillus|Lactococcus|Streptococcus|Enterococcus)
+        BUSCO_LINEAGE="lactobacillales_odb10" ;;
+    Vibrio)
+        BUSCO_LINEAGE="vibrionales_odb10" ;;
+    Clostridium|Clostridioides)
+        BUSCO_LINEAGE="clostridiales_odb10" ;;
+    Campylobacter)
+        BUSCO_LINEAGE="campylobacterales_odb10" ;;
+    Mycobacterium)
+        BUSCO_LINEAGE="corynebacteriales_odb10" ;;
+    *)
+        BUSCO_LINEAGE="bacteria_odb10"
+        log "WARNING: No specific BUSCO lineage mapped for genus '${TOP_GENUS}', defaulting to bacteria_odb10"
+        ;;
+esac
+
+echo "${BUSCO_LINEAGE}" > "${PIPELINE_META}/busco_lineage"
+echo "BUSCO lineage selected: ${BUSCO_LINEAGE}" >> "$SUMMARY"
+
+# ── SCRIPT 1 COMPLETE ─────────────────────────────────────────────────────────
+log "Script 1 (QC & Preprocessing) completed successfully."
+echo "" >> "$SUMMARY"
