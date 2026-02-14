@@ -1,0 +1,326 @@
+#!/bin/bash
+#SBATCH --job-name=Assembly_mapping
+#SBATCH -N 1
+#SBATCH -n 1
+#SBATCH -c 8
+#SBATCH --partition=general
+#SBATCH --qos=general
+#SBATCH --mail-type=ALL
+#SBATCH --mem=200G
+#SBATCH --mail-user=fzn25002@uconn.edu
+#SBATCH -o assembly_mapping_%j.out
+#SBATCH -e assembly_mapping_%j.err
+
+set -euo pipefail
+
+###############################################################################
+# SCRIPT 2 — ASSEMBLY & MAPPING
+# Steps: Unicycler assembly → bwa-mem2 read mapping → samtools processing
+# Inputs: Trimmed reads from Script 1, pipeline metadata
+# Outputs: Assembly FASTA, sorted BAM, mapping stats
+###############################################################################
+
+# ── CONFIGURATION ──────────────────────────────────────────────────────────────
+SAMPLE="88879c1000_S106_L001"
+SAMPLE_SHORT="88879c1000"
+RAWDIR="/labs/Hird/Eric/EAGER_sequences/0_sample/88879content1000-416725627"
+
+# Derived paths
+WORKDIR="${RAWDIR}"
+TRIMDIR="${WORKDIR}/trimmed_sequences"
+ASSEMBLY_DIR="${WORKDIR}/assembly_unicycler"
+MAPPING_DIR="${WORKDIR}/mapping_results"
+PIPELINE_META="${WORKDIR}/.pipeline_meta"
+SUMMARY="${WORKDIR}/pipeline_summary.txt"
+
+TRIM_R1="${TRIMDIR}/${SAMPLE}_R1_001.fastq.gz"
+TRIM_R2="${TRIMDIR}/${SAMPLE}_R2_001.fastq.gz"
+
+# Assembly thresholds
+MIN_CONTIGS=0             # if 0 contigs, assembly failed
+MAX_CONTIGS_WARN=300      # warn if > this many contigs
+MIN_N50=10000             # warn if N50 below this
+MIN_ASSEMBLY_LEN=100000   # minimum total assembly length (100 kb)
+MAX_ASSEMBLY_LEN=15000000 # maximum expected genome size (15 Mb, generous for prokaryotes)
+
+# Mapping thresholds
+MIN_MAPPING_RATE=80       # warn if mapping rate below this %
+MIN_COVERAGE=30           # warn if estimated coverage below this
+
+# ── SETUP ──────────────────────────────────────────────────────────────────────
+mkdir -p "$ASSEMBLY_DIR" "$MAPPING_DIR"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$SUMMARY"
+}
+
+# Verify trimmed reads exist
+if [[ ! -f "$TRIM_R1" ]] || [[ ! -f "$TRIM_R2" ]]; then
+    log "FATAL: Trimmed read files not found. Did Script 1 complete successfully?"
+    log "  Expected: $TRIM_R1 and $TRIM_R2"
+    exit 1
+fi
+
+# Read metadata from Script 1
+READS_AFTER=$(cat "${PIPELINE_META}/reads_after_trim" 2>/dev/null || echo "0")
+READ1_LENGTH=$(cat "${PIPELINE_META}/read1_mean_length" 2>/dev/null || echo "150")
+READ2_LENGTH=$(cat "${PIPELINE_META}/read2_mean_length" 2>/dev/null || echo "150")
+
+echo "" >> "$SUMMARY"
+echo "================================================================================" >> "$SUMMARY"
+echo "  SCRIPT 2: ASSEMBLY & MAPPING" >> "$SUMMARY"
+echo "  Started: $(date)" >> "$SUMMARY"
+echo "================================================================================" >> "$SUMMARY"
+
+# ── STEP 5: UNICYCLER ASSEMBLY ───────────────────────────────────────────────
+log "STEP 5: Running Unicycler de novo assembly..."
+module load unicycler/0.5.0
+
+# ── DECISION POINT 3: Adjust assembly parameters based on read count ─────────
+# For low-coverage datasets, use conservative (--mode conservative) for better
+# contiguity at the cost of speed. For high-coverage, normal mode is fine.
+# Estimate coverage: (reads * avg_read_length) / expected_genome_size
+# Use a rough expected genome size of 4 Mb for a generic prokaryote
+EXPECTED_GENOME=4000000
+AVG_READ_LEN=$(awk "BEGIN {printf \"%.0f\", ($READ1_LENGTH + $READ2_LENGTH) / 2}")
+EST_COVERAGE=$(awk "BEGIN {printf \"%.0f\", ($READS_AFTER * $AVG_READ_LEN) / $EXPECTED_GENOME}")
+
+echo -e "\n--- PRE-ASSEMBLY ESTIMATES ---" >> "$SUMMARY"
+echo "Reads available:        ${READS_AFTER}" >> "$SUMMARY"
+echo "Avg read length:        ${AVG_READ_LEN} bp" >> "$SUMMARY"
+echo "Expected genome size:   ~${EXPECTED_GENOME} bp" >> "$SUMMARY"
+echo "Estimated coverage:     ~${EST_COVERAGE}x" >> "$SUMMARY"
+
+if (( EST_COVERAGE < 30 )); then
+    UNICYCLER_MODE="conservative"
+    log "Low estimated coverage (${EST_COVERAGE}x) — using conservative assembly mode"
+elif (( EST_COVERAGE > 200 )); then
+    UNICYCLER_MODE="bold"
+    log "High estimated coverage (${EST_COVERAGE}x) — using bold assembly mode"
+else
+    UNICYCLER_MODE="normal"
+    log "Adequate coverage (${EST_COVERAGE}x) — using normal assembly mode"
+fi
+
+echo "Unicycler mode:         ${UNICYCLER_MODE}" >> "$SUMMARY"
+
+unicycler \
+    -1 "$TRIM_R1" \
+    -2 "$TRIM_R2" \
+    -o "$ASSEMBLY_DIR" \
+    --min_kmer_frac 0.2 \
+    --max_kmer_frac 0.9 \
+    --threads 8 \
+    --keep 2 \
+    --mode "$UNICYCLER_MODE"
+
+# ── DECISION POINT 4: Evaluate assembly output ──────────────────────────────
+ASSEMBLY="${ASSEMBLY_DIR}/assembly.fasta"
+
+if [[ ! -f "$ASSEMBLY" ]] || [[ ! -s "$ASSEMBLY" ]]; then
+    log "FATAL: Assembly file not found or empty: ${ASSEMBLY}"
+    log "Unicycler may have failed — check assembly_mapping_*.err log"
+    exit 1
+fi
+
+# Calculate basic assembly stats with awk
+ASSEMBLY_STATS=$(awk '
+    /^>/ {
+        if (len > 0) {
+            n++; total += len; lengths[n] = len
+            if (len > max) max = len
+            if (len < min || min == 0) min = len
+        }
+        len = 0; next
+    }
+    { len += length($0) }
+    END {
+        if (len > 0) {
+            n++; total += len; lengths[n] = len
+            if (len > max) max = len
+            if (len < min || min == 0) min = len
+        }
+        # Calculate N50
+        asort(lengths)
+        cumsum = 0
+        for (i = n; i >= 1; i--) {
+            cumsum += lengths[i]
+            if (cumsum >= total / 2) { n50 = lengths[i]; break }
+        }
+        printf "%d\t%d\t%d\t%d\t%d\t%d", n, total, max, min, n50, total/n
+    }
+' "$ASSEMBLY")
+
+NUM_CONTIGS=$(echo "$ASSEMBLY_STATS" | cut -f1)
+TOTAL_LENGTH=$(echo "$ASSEMBLY_STATS" | cut -f2)
+LARGEST_CONTIG=$(echo "$ASSEMBLY_STATS" | cut -f3)
+SMALLEST_CONTIG=$(echo "$ASSEMBLY_STATS" | cut -f4)
+N50=$(echo "$ASSEMBLY_STATS" | cut -f5)
+MEAN_CONTIG=$(echo "$ASSEMBLY_STATS" | cut -f6)
+
+# Check for circular contigs (unicycler marks them)
+CIRCULAR=$(grep -c "circular=true" "$ASSEMBLY" 2>/dev/null || echo "0")
+
+cat >> "$SUMMARY" <<EOF
+
+--- ASSEMBLY RESULTS (UNICYCLER) ---
+Number of contigs:      ${NUM_CONTIGS}
+Total assembly length:  ${TOTAL_LENGTH} bp
+Largest contig:         ${LARGEST_CONTIG} bp
+Smallest contig:        ${SMALLEST_CONTIG} bp
+N50:                    ${N50} bp
+Mean contig length:     ${MEAN_CONTIG} bp
+Circular contigs:       ${CIRCULAR}
+Assembly file:          ${ASSEMBLY}
+EOF
+
+# Store assembly path and stats for downstream
+echo "${ASSEMBLY}" > "${PIPELINE_META}/assembly_path"
+echo "${TOTAL_LENGTH}" > "${PIPELINE_META}/assembly_length"
+echo "${NUM_CONTIGS}" > "${PIPELINE_META}/num_contigs"
+
+# Gate: assembly produced contigs?
+if (( NUM_CONTIGS == 0 )); then
+    log "FATAL: Assembly produced 0 contigs. Cannot proceed."
+    exit 1
+fi
+
+# Gate: excessive fragmentation
+if (( NUM_CONTIGS > MAX_CONTIGS_WARN )); then
+    log "WARNING: Assembly is highly fragmented (${NUM_CONTIGS} contigs > ${MAX_CONTIGS_WARN} threshold)"
+    echo "  → Consider checking for contamination or increasing coverage" >> "$SUMMARY"
+fi
+
+# Gate: N50 check
+if (( N50 < MIN_N50 )); then
+    log "WARNING: N50 (${N50} bp) is below recommended threshold (${MIN_N50} bp)"
+    echo "  → Assembly contiguity is poor" >> "$SUMMARY"
+fi
+
+# Gate: assembly size sanity check
+if (( TOTAL_LENGTH < MIN_ASSEMBLY_LEN )); then
+    log "WARNING: Assembly (${TOTAL_LENGTH} bp) is suspiciously small for a prokaryote"
+    echo "  → Possible incomplete assembly or wrong organism" >> "$SUMMARY"
+fi
+if (( TOTAL_LENGTH > MAX_ASSEMBLY_LEN )); then
+    log "WARNING: Assembly (${TOTAL_LENGTH} bp) is larger than expected for a prokaryote"
+    echo "  → Possible contamination or eukaryotic DNA" >> "$SUMMARY"
+fi
+
+# Recalculate coverage with actual assembly size
+ACTUAL_COVERAGE=$(awk "BEGIN {printf \"%.1f\", ($READS_AFTER * $AVG_READ_LEN) / $TOTAL_LENGTH}")
+echo "Estimated coverage (actual genome): ~${ACTUAL_COVERAGE}x" >> "$SUMMARY"
+echo "${ACTUAL_COVERAGE}" > "${PIPELINE_META}/estimated_coverage"
+
+# ── STEP 6: BWA-MEM2 READ MAPPING ───────────────────────────────────────────
+log "STEP 6: Indexing assembly and mapping reads with bwa-mem2..."
+module load bwa-mem2/2.2.1
+module load samtools/1.9
+
+# Index the assembly
+bwa-mem2 index "$ASSEMBLY"
+
+# Map trimmed reads back to assembly
+bwa-mem2 mem -t 8 \
+    -R "@RG\tID:${SAMPLE_SHORT}\tSM:${SAMPLE_SHORT}\tPL:ILLUMINA" \
+    "$ASSEMBLY" \
+    "$TRIM_R1" \
+    "$TRIM_R2" \
+    > "${MAPPING_DIR}/${SAMPLE_SHORT}_aligned.sam"
+
+# ── STEP 7: SAMTOOLS PROCESSING ─────────────────────────────────────────────
+log "STEP 7: Converting SAM → sorted BAM, generating stats..."
+
+# Convert, sort, index
+samtools view -@ 4 -bS "${MAPPING_DIR}/${SAMPLE_SHORT}_aligned.sam" \
+    | samtools sort -@ 4 -o "${MAPPING_DIR}/${SAMPLE_SHORT}_sorted.bam"
+
+samtools index "${MAPPING_DIR}/${SAMPLE_SHORT}_sorted.bam"
+
+# Generate stats
+samtools stats "${MAPPING_DIR}/${SAMPLE_SHORT}_sorted.bam" \
+    > "${MAPPING_DIR}/${SAMPLE_SHORT}_sorted.stats"
+
+# Flagstat for quick mapping summary
+samtools flagstat "${MAPPING_DIR}/${SAMPLE_SHORT}_sorted.bam" \
+    > "${MAPPING_DIR}/${SAMPLE_SHORT}_flagstat.txt"
+
+# Clean up SAM to save disk space
+rm -f "${MAPPING_DIR}/${SAMPLE_SHORT}_aligned.sam"
+
+# ── DECISION POINT 5: Evaluate mapping results ──────────────────────────────
+FLAGSTAT="${MAPPING_DIR}/${SAMPLE_SHORT}_flagstat.txt"
+
+TOTAL_READS_MAP=$(head -1 "$FLAGSTAT" | awk '{print $1}')
+MAPPED_READS=$(grep "mapped (" "$FLAGSTAT" | head -1 | awk '{print $1}')
+PROPERLY_PAIRED=$(grep "properly paired" "$FLAGSTAT" | awk '{print $1}')
+
+# Extract mapping rate from flagstat (format: "12345 + 0 mapped (98.50% : N/A)")
+MAPPING_RATE=$(grep "mapped (" "$FLAGSTAT" | head -1 | grep -oP '\(\K[0-9.]+')
+PROPER_PAIR_RATE=$(grep "properly paired" "$FLAGSTAT" | grep -oP '\(\K[0-9.]+')
+
+# Get coverage from samtools stats
+AVG_COVERAGE=$(grep "^SN" "${MAPPING_DIR}/${SAMPLE_SHORT}_sorted.stats" \
+    | grep "average length" | head -1 | awk '{print $NF}')
+BASES_MAPPED=$(grep "^SN" "${MAPPING_DIR}/${SAMPLE_SHORT}_sorted.stats" \
+    | grep "bases mapped (cigar)" | awk '{print $NF}')
+MEAN_INSERT=$(grep "^SN" "${MAPPING_DIR}/${SAMPLE_SHORT}_sorted.stats" \
+    | grep "insert size average" | awk '{print $NF}')
+INSERT_SD=$(grep "^SN" "${MAPPING_DIR}/${SAMPLE_SHORT}_sorted.stats" \
+    | grep "insert size standard deviation" | awk '{print $NF}')
+ERROR_RATE=$(grep "^SN" "${MAPPING_DIR}/${SAMPLE_SHORT}_sorted.stats" \
+    | grep "error rate" | awk '{print $NF}')
+
+# Calculate actual depth of coverage
+if [[ -n "$BASES_MAPPED" ]] && (( TOTAL_LENGTH > 0 )); then
+    DEPTH_COVERAGE=$(awk "BEGIN {printf \"%.1f\", $BASES_MAPPED / $TOTAL_LENGTH}")
+else
+    DEPTH_COVERAGE="N/A"
+fi
+
+cat >> "$SUMMARY" <<EOF
+
+--- MAPPING RESULTS (BWA-MEM2 / SAMTOOLS) ---
+Total reads in BAM:     ${TOTAL_READS_MAP}
+Mapped reads:           ${MAPPED_READS} (${MAPPING_RATE}%)
+Properly paired:        ${PROPERLY_PAIRED} (${PROPER_PAIR_RATE}%)
+Bases mapped (CIGAR):   ${BASES_MAPPED}
+Depth of coverage:      ${DEPTH_COVERAGE}x
+Mean insert size:       ${MEAN_INSERT} ± ${INSERT_SD}
+Error rate:             ${ERROR_RATE}
+Sorted BAM:            ${MAPPING_DIR}/${SAMPLE_SHORT}_sorted.bam
+EOF
+
+# Store for downstream
+echo "${DEPTH_COVERAGE}" > "${PIPELINE_META}/depth_coverage"
+echo "${MAPPING_RATE}" > "${PIPELINE_META}/mapping_rate"
+
+# Gate: mapping rate
+MAPPING_LOW=$(awk "BEGIN {print ($MAPPING_RATE < $MIN_MAPPING_RATE) ? 1 : 0}")
+if [[ "$MAPPING_LOW" -eq 1 ]]; then
+    log "WARNING: Mapping rate (${MAPPING_RATE}%) is below threshold (${MIN_MAPPING_RATE}%)"
+    echo "  → Possible contamination, chimeric assembly, or wrong reads mapped" >> "$SUMMARY"
+fi
+
+# Gate: coverage depth
+if [[ "$DEPTH_COVERAGE" != "N/A" ]]; then
+    COV_LOW=$(awk "BEGIN {print ($DEPTH_COVERAGE < $MIN_COVERAGE) ? 1 : 0}")
+    if [[ "$COV_LOW" -eq 1 ]]; then
+        log "WARNING: Coverage depth (${DEPTH_COVERAGE}x) is below recommended (${MIN_COVERAGE}x)"
+        echo "  → Assembly quality may be compromised" >> "$SUMMARY"
+    fi
+fi
+
+# Gate: insert size sanity (typical Illumina PE is 200-600 bp)
+if [[ -n "$MEAN_INSERT" ]]; then
+    INSERT_WEIRD=$(awk "BEGIN {print ($MEAN_INSERT < 100 || $MEAN_INSERT > 1000) ? 1 : 0}")
+    if [[ "$INSERT_WEIRD" -eq 1 ]]; then
+        log "WARNING: Mean insert size (${MEAN_INSERT}) is outside typical range (100-1000 bp)"
+        echo "  → Check library prep or adapter contamination" >> "$SUMMARY"
+    fi
+fi
+
+# ── SCRIPT 2 COMPLETE ────────────────────────────────────────────────────────
+log "Script 2 (Assembly & Mapping) completed successfully."
+echo "" >> "$SUMMARY"
