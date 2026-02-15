@@ -20,7 +20,7 @@ set -euo pipefail
 ###############################################################################
 
 # ── CONFIGURATION ──────────────────────────────────────────────────────────────
-# Modify for each sample
+# Modify these variables for each sample
 SAMPLE="88899c100_S110_L001"
 RAWDIR="/labs/Hird/Eric/EAGER_sequences/1_sample/88899content100-416743538"
 KRAKENDB="/isg/shared/databases/kraken/v06.2025/standard"
@@ -98,6 +98,7 @@ fastp \
 # ── DECISION POINT 1: Evaluate fastp results ─────────────────────────────────
 FASTP_JSON="${REPORTDIR}/${SAMPLE}_fastp.json"
 
+# Parse fastp JSON with Python for Summary file
 eval $(python3 -c "
 import json, sys
 with open('${FASTP_JSON}') as f:
@@ -105,6 +106,10 @@ with open('${FASTP_JSON}') as f:
 s = d['summary']
 print(f\"READS_BEFORE={s['before_filtering']['total_reads']}\")
 print(f\"READS_AFTER={s['after_filtering']['total_reads']}\")
+print(f\"BASES_BEFORE={s['before_filtering']['total_bases']}\")
+print(f\"BASES_AFTER={s['after_filtering']['total_bases']}\")
+print(f\"GC_BEFORE={s['before_filtering']['gc_content']}\")
+print(f\"GC_AFTER={s['after_filtering']['gc_content']}\")
 print(f\"Q30_RATE={s['after_filtering']['q30_rate']}\")
 print(f\"READ1_LENGTH={s['after_filtering']['read1_mean_length']}\")
 print(f\"READ2_LENGTH={s['after_filtering']['read2_mean_length']}\")
@@ -120,7 +125,10 @@ cat >> "$SUMMARY" <<EOF
 --- FASTP TRIMMING RESULTS ---
 Reads before filtering:  ${READS_BEFORE}
 Reads after filtering:   ${READS_AFTER}
-Reads removed:           $((READS_BEFORE - READS_AFTER)) ($(awk "BEGIN {printf \"%.1f\", (($READS_BEFORE-$READS_AFTER)/$READS_BEFORE)*100}")%)
+Bases before filtering:  ${BASES_BEFORE}
+Bases after filtering:   ${BASES_AFTER}
+GC before filtering:     ${GC_BEFORE}
+GC after filtering       ${GC_AFTER}
 Q30 rate (post-filter):  ${Q30_RATE}
 Mean read length R1:     ${READ1_LENGTH}
 Mean read length R2:     ${READ2_LENGTH}
@@ -129,12 +137,10 @@ Adapter-trimmed reads:   ${ADAPTER_R1}
 EOF
 
 # Store metadata for downstream scripts (coverage calculation, etc.)
-echo "${READS_AFTER}" > "${PIPELINE_META}/reads_after_trim"
-echo "${READ1_LENGTH}" > "${PIPELINE_META}/read1_mean_length"
-echo "${READ2_LENGTH}" > "${PIPELINE_META}/read2_mean_length"
+echo "${BASES_AFTER}" > "${PIPELINE_META}/bases_after_trim"
 
 # Gate: minimum read count
-if (( READS_AFTER < MIN_READS )); then
+if (( BASES_AFTER < MIN_READS )); then
     log "FATAL: Read count after filtering (${READS_AFTER}) below minimum threshold (${MIN_READS})"
     log "Pipeline cannot produce a reliable assembly. Exiting."
     exit 1
@@ -149,7 +155,7 @@ if [[ "$Q30_PASS" -eq 0 ]]; then
 fi
 
 # Gate: excessive read loss
-READ_LOSS_PCT=$(awk "BEGIN {printf \"%.1f\", (($READS_BEFORE-$READS_AFTER)/$READS_BEFORE)*100}")
+READ_LOSS_PCT=$(awk "BEGIN {printf \"%.1f\", (($BASES_BEFORE-$BASES_AFTER)/$BASES_BEFORE)*100}")
 EXCESSIVE_LOSS=$(awk "BEGIN {print ($READ_LOSS_PCT > 50) ? 1 : 0}")
 if [[ "$EXCESSIVE_LOSS" -eq 1 ]]; then
     log "WARNING: >50% of reads lost during trimming (${READ_LOSS_PCT}%)"
@@ -191,7 +197,7 @@ KRAKEN_TMP="${REPORTDIR}/.kraken_species_sorted.tmp"
 
 UNCLASSIFIED_PCT=$(awk '$4 == "U" {printf "%.2f", $1}' "$KRAKEN_REPORT")
 
-# Extract and sort species-level hits into a temp file (avoids sort|head pipe)
+# Extract and sort species level hits into temp file
 awk '$4 == "S"' "$KRAKEN_REPORT" | sort -t$'\t' -k1 -rn > "$KRAKEN_TMP"
 
 TOP_SPECIES_LINE=$(awk 'NR==1' "$KRAKEN_TMP")
@@ -233,7 +239,7 @@ fi
 case "$TOP_GENUS" in
     Bacillus|Lysinibacillus|Paenibacillus|Staphylococcus|Listeria)
         BUSCO_LINEAGE="bacillales_odb10" ;;
-    Escherichia|Salmonella|Klebsiella|Enterobacter|Citrobacter|Shigella)
+    Escherichia|Salmonella|Klebsiella|Enterobacter|Citrobacter|Shigella|Hafnia)
         BUSCO_LINEAGE="enterobacterales_odb10" ;;
     Pseudomonas|Acinetobacter)
         BUSCO_LINEAGE="pseudomonadales_odb10" ;;
