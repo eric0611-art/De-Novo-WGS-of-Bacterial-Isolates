@@ -20,7 +20,7 @@ set -euo pipefail
 ###############################################################################
 
 # ── CONFIGURATION ──────────────────────────────────────────────────────────────
-# Modify these variables for each sample or source them from an external config
+# Modify for each sample
 SAMPLE="88899c100_S110_L001"
 RAWDIR="/labs/Hird/Eric/EAGER_sequences/1_sample/88899content100-416743538"
 KRAKENDB="/isg/shared/databases/kraken/v06.2025/standard"
